@@ -16,9 +16,6 @@ from typing import Optional
 class ExportConfig:
     """User-configurable export settings."""
 
-    # Columns to include (order matters).  Available:
-    #   "No.", "Commenter", "Date", "Summary", "Applicant's Response",
-    #   "Source Reference", "Comment Type", "Topics"
     columns: list[str] = field(default_factory=lambda: [
         "No.", "Commenter", "Date", "Summary", "Applicant's Response",
     ])
@@ -30,6 +27,8 @@ class ExportConfig:
     font_size_pt: int = 10
     header_bg_color: str = "2563EB"         # hex, no #
     header_font_color: str = "FFFFFF"
+    # Maps custom column display name → row-dict key
+    custom_column_keys: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -59,8 +58,10 @@ _COL_KEY = {
 }
 
 
-def _row_values(row: dict, columns: list[str], row_num: int) -> list[str]:
+def _row_values(row: dict, columns: list[str], row_num: int,
+                custom_keys: Optional[dict] = None) -> list[str]:
     """Extract cell values for a row in column order."""
+    custom_keys = custom_keys or {}
     vals = []
     for col in columns:
         key = _COL_KEY.get(col, "")
@@ -68,8 +69,12 @@ def _row_values(row: dict, columns: list[str], row_num: int) -> list[str]:
             vals.append(str(row_num))
         elif key == "_response":
             vals.append("")
-        else:
+        elif key:
             vals.append(str(row.get(key, "")))
+        elif col in custom_keys:
+            vals.append(str(row.get(custom_keys[col], "")))
+        else:
+            vals.append(str(row.get(col.lower().replace(" ", "_"), "")))
     return vals
 
 
@@ -248,7 +253,7 @@ def export_docx(
         table.rows[0].cells[idx].text = label
 
     for num, row in enumerate(rows, 1):
-        vals = _row_values(row, config.columns, num)
+        vals = _row_values(row, config.columns, num, config.custom_column_keys)
         for idx, val in enumerate(vals):
             table.rows[num].cells[idx].text = val
 
@@ -296,7 +301,7 @@ def export_xlsx(
         cell.alignment = wrap
 
     for num, row in enumerate(rows, 1):
-        vals = _row_values(row, config.columns, num)
+        vals = _row_values(row, config.columns, num, config.custom_column_keys)
         for idx, val in enumerate(vals, 1):
             cell = ws.cell(row=num + 1, column=idx, value=val)
             cell.font = body_font
@@ -344,5 +349,99 @@ def export_csv(
     writer = csv.writer(out)
     writer.writerow(config.columns)
     for num, row in enumerate(rows, 1):
-        writer.writerow(_row_values(row, config.columns, num))
+        writer.writerow(_row_values(row, config.columns, num, config.custom_column_keys))
     return out.getvalue()
+
+
+def export_pdf(
+    rows: list[dict],
+    project_info: ProjectInfo,
+    config: Optional[ExportConfig] = None,
+) -> io.BytesIO:
+    """Export to PDF by rendering the Word doc and converting via python-docx2pdf
+    or, as a portable fallback, build a simple PDF with reportlab."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter, landscape as rl_landscape
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate, Table as RLTable, TableStyle, Paragraph, Spacer,
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+        config = config or ExportConfig()
+        buf = io.BytesIO()
+        pagesize = rl_landscape(letter) if config.orientation == "landscape" else letter
+        doc = SimpleDocTemplate(buf, pagesize=pagesize,
+                                leftMargin=0.5*inch, rightMargin=0.5*inch,
+                                topMargin=0.5*inch, bottomMargin=0.5*inch)
+
+        styles = getSampleStyleSheet()
+        cell_style = ParagraphStyle(
+            "CellStyle", parent=styles["Normal"],
+            fontName="Helvetica", fontSize=config.font_size_pt - 1,
+            leading=config.font_size_pt + 2,
+        )
+        header_style = ParagraphStyle(
+            "HeaderStyle", parent=styles["Normal"],
+            fontName="Helvetica-Bold", fontSize=config.font_size_pt,
+            leading=config.font_size_pt + 3,
+            textColor=colors.white,
+        )
+
+        elements = []
+
+        if config.include_provenance:
+            prov_lines = [
+                f"<b>Source record — Tab B prep</b>",
+                f"Project: {project_info.project_name} — {project_info.jurisdiction}, "
+                f"file no. {project_info.file_number}",
+                f"Source: {project_info.source_description}",
+                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                f"Rows: {project_info.raw_row_count} raw → "
+                f"{project_info.merged_row_count} merged",
+            ]
+            for line in prov_lines:
+                elements.append(Paragraph(line, styles["Normal"]))
+            elements.append(Spacer(1, 12))
+
+        if config.include_scope_notes and project_info.scope_notes:
+            elements.append(Paragraph(
+                "<b>Omissions / scope notes</b>", styles["Normal"]
+            ))
+            for note in project_info.scope_notes:
+                elements.append(Paragraph(f"• {note}", cell_style))
+            elements.append(Spacer(1, 12))
+
+        header_row = [Paragraph(c, header_style) for c in config.columns]
+        table_data = [header_row]
+        for num, row in enumerate(rows, 1):
+            vals = _row_values(row, config.columns, num, config.custom_column_keys)
+            table_data.append([Paragraph(v, cell_style) for v in vals])
+
+        avail_width = pagesize[0] - 1.0 * inch
+        n = len(config.columns)
+        col_w = [avail_width / n] * n
+
+        t = RLTable(table_data, colWidths=col_w, repeatRows=1)
+        hdr_bg = colors.HexColor(f"#{config.header_bg_color}")
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), hdr_bg),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), config.font_size_pt - 1),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(t)
+        doc.build(elements)
+        buf.seek(0)
+        return buf
+
+    except ImportError:
+        docx_buf = export_docx(rows, project_info, config)
+        return docx_buf

@@ -1,15 +1,19 @@
 """Public Comment Response Table Builder — Streamlit app.
 
-Upload a compiled-comments PDF or paste a hearing-examiner exhibit index,
-let Claude parse and summarize the comments, review and edit the rows,
-then export in your preferred format.
+Upload a compiled-comments PDF, paste a hearing-examiner exhibit index,
+or provide a web URL — let Claude parse and summarize the comments,
+review and edit the rows, then export in your preferred format.
 """
 
 import streamlit as st
 import pandas as pd
+import requests
 
 from ai_parser import parse_comments, extract_pdf_text, DEFAULT_MODEL
-from exporters import ExportConfig, ProjectInfo, export_docx, export_xlsx, export_csv
+from exporters import (
+    ExportConfig, ProjectInfo,
+    export_docx, export_xlsx, export_csv, export_pdf,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -21,7 +25,7 @@ st.set_page_config(
     layout="wide",
 )
 
-ALL_COLUMNS = [
+BUILT_IN_COLUMNS = [
     "No.", "Commenter", "Date", "Summary", "Applicant's Response",
     "Source Reference", "Comment Type", "Topics",
 ]
@@ -29,6 +33,12 @@ ALL_COLUMNS = [
 DEFAULT_COLUMNS = [
     "No.", "Commenter", "Date", "Summary", "Applicant's Response",
 ]
+
+MODEL_OPTIONS = {
+    "Claude Sonnet (fast, recommended)": "claude-sonnet-4-20250514",
+    "Claude Opus (most capable)": "claude-opus-4-20250514",
+    "Claude Haiku (fastest, cheapest)": "claude-haiku-4-20250514",
+}
 
 
 def _init_state():
@@ -39,6 +49,8 @@ def _init_state():
         "raw_row_count": 0,
         "merged_row_count": 0,
         "pdf_text": "",
+        "custom_columns": [],
+        "custom_column_defs": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -48,7 +60,7 @@ def _init_state():
 _init_state()
 
 # ---------------------------------------------------------------------------
-# Sidebar — project info, AI settings, export settings
+# Sidebar
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
@@ -57,36 +69,97 @@ with st.sidebar:
     file_number = st.text_input("File / permit number", placeholder="e.g. 2024104513")
     jurisdiction = st.text_input("Jurisdiction", placeholder="e.g. Thurston County")
 
-    st.divider()
-    st.header("AI Settings")
-    secrets_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
-    if secrets_key:
-        api_key = secrets_key
-        st.success("API key loaded from app secrets.")
-    else:
-        api_key = st.text_input("Claude API key", type="password",
-                                help="Your Anthropic API key. Never shared or stored.")
-    model = st.text_input("Model", value=DEFAULT_MODEL,
-                          help="Claude model to use for parsing.")
+    # ---- AI Settings (collapsed by default) ----
+    with st.expander("AI Settings", expanded=False):
+        secrets_key = ""
+        try:
+            secrets_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+        if secrets_key:
+            api_key = secrets_key
+            st.success("API key loaded automatically.")
+        else:
+            api_key = st.text_input("Claude API key", type="password",
+                                    help="Your Anthropic API key. Never shared or stored.")
+        model_label = st.selectbox("AI model", list(MODEL_OPTIONS.keys()))
+        model = MODEL_OPTIONS[model_label]
 
     st.divider()
+
+    # ---- Export Settings ----
     st.header("Export Settings")
-    export_format = st.selectbox("Format", ["Word (.docx)", "Excel (.xlsx)", "CSV (.csv)"])
+    export_format = st.selectbox(
+        "Format",
+        ["Word (.docx)", "Excel (.xlsx)", "CSV (.csv)", "PDF (.pdf)"],
+    )
     orientation = st.radio("Page orientation", ["Landscape", "Portrait"], horizontal=True)
+
+    # Column picker: built-in + any custom columns the user added
+    all_available = BUILT_IN_COLUMNS + st.session_state.get("custom_columns", [])
     selected_cols = st.multiselect(
         "Columns to include",
-        ALL_COLUMNS,
-        default=DEFAULT_COLUMNS,
+        all_available,
+        default=[c for c in DEFAULT_COLUMNS if c in all_available],
         help="Choose and reorder the columns for your export.",
     )
-    include_provenance = st.checkbox("Include provenance block", value=True)
+
+    include_provenance = st.checkbox(
+        "Include source info header",
+        value=True,
+        help="Adds a block above the table with project name, source, "
+             "date generated, and row counts — useful as an audit trail.",
+    )
     include_scope_notes = st.checkbox("Include scope notes", value=True)
 
     st.divider()
-    st.header("Styling")
-    font_name = st.selectbox("Font", ["Calibri", "Arial", "Times New Roman", "Aptos"])
-    font_size = st.slider("Font size (pt)", 8, 14, 10)
-    header_color = st.color_picker("Header background", "#2563EB")
+
+    # ---- Custom Columns ----
+    with st.expander("Custom Columns", expanded=False):
+        st.caption(
+            "Add your own columns beyond the built-in ones. "
+            "Define what should go in each column and the AI will try to fill it."
+        )
+        new_col_name = st.text_input("New column name", placeholder="e.g. Priority Level")
+        new_col_def = st.text_area(
+            "What goes in this column?",
+            placeholder='e.g. "Rate each comment High / Medium / Low based on '
+                        'how directly it affects permit conditions."',
+            height=80,
+            key="new_col_def",
+        )
+        if st.button("Add column") and new_col_name:
+            if new_col_name not in st.session_state["custom_columns"]:
+                st.session_state["custom_columns"].append(new_col_name)
+                st.session_state["custom_column_defs"][new_col_name] = new_col_def
+                st.success(f"Added column: {new_col_name}")
+                st.rerun()
+
+        if st.session_state["custom_columns"]:
+            st.write("**Custom columns defined:**")
+            for cc in st.session_state["custom_columns"]:
+                defn = st.session_state["custom_column_defs"].get(cc, "")
+                st.write(f"- **{cc}**: {defn or '(no definition)'}")
+            if st.button("Clear all custom columns"):
+                st.session_state["custom_columns"] = []
+                st.session_state["custom_column_defs"] = {}
+                st.rerun()
+
+    st.divider()
+
+    # ---- Styling ----
+    with st.expander("Styling", expanded=False):
+        font_name = st.selectbox("Font", ["Calibri", "Arial", "Times New Roman", "Aptos"])
+        font_size = st.slider("Font size (pt)", 8, 14, 10)
+        header_color = st.color_picker("Header background", "#2563EB")
+
+# Defaults if styling expander was never opened
+if "font_name" not in dir():
+    font_name = "Calibri"
+if "font_size" not in dir():
+    font_size = 10
+if "header_color" not in dir():
+    header_color = "#2563EB"
 
 # ---------------------------------------------------------------------------
 # Main area — three tabs
@@ -102,7 +175,11 @@ tab_input, tab_review, tab_export = st.tabs(["1 — Input", "2 — Review & Edit
 with tab_input:
     mode = st.radio(
         "Input type",
-        ["Upload compiled-comments PDF", "Paste exhibit index or text"],
+        [
+            "Upload compiled-comments PDF",
+            "Paste exhibit index or text",
+            "Fetch from a website URL",
+        ],
         horizontal=True,
     )
 
@@ -116,6 +193,19 @@ with tab_input:
         height=80,
     )
 
+    # Append custom-column instructions so the AI knows to fill them
+    extra_col_instructions = ""
+    if st.session_state["custom_column_defs"]:
+        parts = []
+        for cname, cdef in st.session_state["custom_column_defs"].items():
+            parts.append(f'- Column "{cname}": {cdef}')
+        extra_col_instructions = (
+            "\n\nADDITIONAL COLUMNS TO POPULATE:\n"
+            "For each row, also include these extra fields in the JSON:\n"
+            + "\n".join(parts)
+            + "\nUse the column name (lowercase, spaces replaced with underscores) as the JSON key."
+        )
+
     if mode == "Upload compiled-comments PDF":
         uploaded = st.file_uploader("Upload PDF", type=["pdf"])
         if uploaded:
@@ -127,6 +217,33 @@ with tab_input:
                 st.text(st.session_state["pdf_text"][:3000])
         source_text = st.session_state.get("pdf_text", "")
         parse_mode = "pdf"
+
+    elif mode == "Fetch from a website URL":
+        url = st.text_input(
+            "Website URL",
+            placeholder="https://www.thurstoncountywa.gov/...",
+        )
+        if url and st.button("Fetch page"):
+            with st.spinner("Fetching page content…"):
+                try:
+                    resp = requests.get(url, timeout=30, headers={
+                        "User-Agent": "CommentResponseTableBuilder/1.0"
+                    })
+                    resp.raise_for_status()
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for tag in soup(["script", "style", "nav", "footer", "header"]):
+                        tag.decompose()
+                    page_text = soup.get_text(separator="\n", strip=True)
+                    st.session_state["pdf_text"] = page_text
+                    st.success(f"Fetched {len(page_text):,} characters from {url}")
+                    with st.expander("Preview fetched text (first 3,000 chars)"):
+                        st.text(page_text[:3000])
+                except Exception as e:
+                    st.error(f"Failed to fetch URL: {e}")
+        source_text = st.session_state.get("pdf_text", "")
+        parse_mode = "exhibit_index"
+
     else:
         source_text = st.text_area(
             "Paste exhibit index or comment text",
@@ -141,17 +258,18 @@ with tab_input:
                                   disabled=not (source_text and api_key))
     with col_status:
         if not api_key:
-            st.info("Enter your Claude API key in the sidebar to enable parsing.")
+            st.info("Set your Claude API key in AI Settings (sidebar) to enable parsing.")
         elif not source_text:
-            st.info("Upload a PDF or paste text above.")
+            st.info("Upload a PDF, paste text, or fetch a URL above.")
 
     if parse_clicked:
+        full_instructions = custom_instructions + extra_col_instructions
         with st.spinner("Claude is reading and parsing the comments…"):
             try:
                 result = parse_comments(
                     source_text,
                     mode=parse_mode,
-                    custom_instructions=custom_instructions,
+                    custom_instructions=full_instructions,
                     api_key=api_key,
                     model=model,
                 )
@@ -179,8 +297,14 @@ with tab_review:
             st.caption(f"AI notes: {st.session_state['parse_notes']}")
 
         df = pd.DataFrame(rows)
-        display_cols = [c for c in ["commenter", "date", "summary", "source_ref",
-                                     "comment_type", "topics"] if c in df.columns]
+        base_display = ["commenter", "date", "summary", "source_ref",
+                        "comment_type", "topics"]
+        custom_keys = [
+            c.lower().replace(" ", "_")
+            for c in st.session_state.get("custom_columns", [])
+        ]
+        display_cols = [c for c in base_display + custom_keys if c in df.columns]
+
         col_config = {
             "commenter": st.column_config.TextColumn("Commenter", width="medium"),
             "date": st.column_config.TextColumn("Date", width="small"),
@@ -193,9 +317,13 @@ with tab_review:
             ),
             "topics": st.column_config.TextColumn("Topics", width="medium"),
         }
+        for ck in custom_keys:
+            col_config[ck] = st.column_config.TextColumn(
+                ck.replace("_", " ").title(), width="medium"
+            )
 
         edited_df = st.data_editor(
-            df[display_cols],
+            df[display_cols] if display_cols else df,
             column_config=col_config,
             num_rows="dynamic",
             use_container_width=True,
@@ -235,6 +363,10 @@ with tab_export:
             font_size_pt=font_size,
             header_bg_color=header_color.lstrip("#"),
             header_font_color="FFFFFF",
+            custom_column_keys={
+                c: c.lower().replace(" ", "_")
+                for c in st.session_state.get("custom_columns", [])
+            },
         )
 
         info = ProjectInfo(
@@ -254,20 +386,25 @@ with tab_export:
 
         st.subheader("Preview")
         preview_df = pd.DataFrame(rows)
-        preview_cols = {
-            "No.": range(1, len(rows) + 1),
+        preview_cols = {"No.": range(1, len(rows) + 1)}
+        key_map = {
+            "Commenter": "commenter", "Date": "date", "Summary": "summary",
+            "Source Reference": "source_ref", "Comment Type": "comment_type",
+            "Topics": "topics", "Applicant's Response": "_blank",
         }
-        key_map = {"Commenter": "commenter", "Date": "date", "Summary": "summary",
-                    "Source Reference": "source_ref", "Comment Type": "comment_type",
-                    "Topics": "topics", "Applicant's Response": "_blank"}
+        for cc in st.session_state.get("custom_columns", []):
+            key_map[cc] = cc.lower().replace(" ", "_")
+
         for col in cols_to_use:
             if col == "No.":
                 continue
-            k = key_map.get(col, "")
+            k = key_map.get(col, col.lower().replace(" ", "_"))
             if k == "_blank":
                 preview_cols[col] = [""] * len(rows)
             elif k in preview_df.columns:
                 preview_cols[col] = preview_df[k].tolist()
+            else:
+                preview_cols[col] = [""] * len(rows)
         st.dataframe(pd.DataFrame(preview_cols), use_container_width=True, hide_index=True)
 
         st.divider()
@@ -288,6 +425,15 @@ with tab_export:
                 data=buf,
                 file_name=f"{safe_name}_Tab_B.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        elif export_format == "PDF (.pdf)":
+            buf = export_pdf(rows, info, config)
+            st.download_button(
+                "Download PDF (.pdf)",
+                data=buf,
+                file_name=f"{safe_name}_Tab_B.pdf",
+                mime="application/pdf",
                 type="primary",
             )
         else:
