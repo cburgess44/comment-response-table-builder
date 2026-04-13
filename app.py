@@ -357,6 +357,31 @@ with tab_input:
             except Exception as e:
                 st.error(f"Parsing failed: {e}")
 
+    # Show a quick results preview right here on Tab 1 after parsing
+    if st.session_state["parsed_rows"] is not None:
+        rows = st.session_state["parsed_rows"]
+        st.divider()
+        st.subheader(f"Results: {len(rows)} rows parsed")
+        if st.session_state["parse_notes"]:
+            st.caption(st.session_state["parse_notes"])
+
+        preview = pd.DataFrame([
+            {
+                "No.": i,
+                "Commenter": r.get("commenter", ""),
+                "Date": r.get("date", ""),
+                "Summary": (r.get("summary", "")[:120] + "…"
+                            if len(r.get("summary", "")) > 120
+                            else r.get("summary", "")),
+            }
+            for i, r in enumerate(rows, 1)
+        ])
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        st.info(
+            "Go to the **2 — Review & Edit** tab to edit rows and summaries, "
+            "then **3 — Export** to download."
+        )
+
 # ---- Tab 2: Review & Edit -----------------------------------------------
 
 with tab_review:
