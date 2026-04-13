@@ -5,6 +5,7 @@ or provide a web URL — let Claude parse and summarize the comments,
 review and edit the rows, then export in your preferred format.
 """
 
+import re
 import streamlit as st
 import pandas as pd
 import requests
@@ -49,6 +50,8 @@ def _init_state():
         "raw_row_count": 0,
         "merged_row_count": 0,
         "pdf_text": "",
+        "url_projects": None,
+        "url_full_text": "",
         "custom_columns": [],
         "custom_column_defs": {},
     }
@@ -235,12 +238,81 @@ with tab_input:
                     for tag in soup(["script", "style", "nav", "footer", "header"]):
                         tag.decompose()
                     page_text = soup.get_text(separator="\n", strip=True)
-                    st.session_state["pdf_text"] = page_text
-                    st.success(f"Fetched {len(page_text):,} characters from {url}")
-                    with st.expander("Preview fetched text (first 3,000 chars)"):
-                        st.text(page_text[:3000])
+
+                    # Detect if the page contains multiple projects.
+                    # Hearing examiner pages use lines like:
+                    #   " 2024104513 88th Place Preliminary Plat - April 14, 2026 "
+                    # They may have leading/trailing whitespace, em-dashes,
+                    # and varying separators.
+                    project_pattern = re.compile(
+                        r"^\s*(\d{10})\s*[–—-]?\s*(.+?)$", re.MULTILINE
+                    )
+                    matches = project_pattern.findall(page_text)
+                    matches = [
+                        (n, name) for n, name in matches
+                        if len(name.strip()) > 15
+                    ]
+
+                    if len(matches) > 1:
+                        sections = {}
+                        lines = page_text.split("\n")
+                        current_key = None
+                        current_lines = []
+                        for line in lines:
+                            m = project_pattern.match(line)
+                            if m and len(m.group(2).strip()) > 15:
+                                if current_key:
+                                    sections[current_key] = "\n".join(current_lines)
+                                proj_num = m.group(1)
+                                proj_name = m.group(2).strip()
+                                current_key = f"{proj_num} — {proj_name}"
+                                current_lines = [line]
+                            elif current_key:
+                                current_lines.append(line)
+                        if current_key:
+                            sections[current_key] = "\n".join(current_lines)
+
+                        st.session_state["url_projects"] = sections
+                        st.session_state["url_full_text"] = page_text
+                        st.success(
+                            f"Found **{len(sections)} projects** on this page. "
+                            f"Select one below."
+                        )
+                    else:
+                        st.session_state["url_projects"] = None
+                        st.session_state["pdf_text"] = page_text
+                        st.success(
+                            f"Fetched {len(page_text):,} characters from {url}"
+                        )
                 except Exception as e:
                     st.error(f"Failed to fetch URL: {e}")
+
+        # Project selector (if multi-project page was fetched)
+        if st.session_state.get("url_projects"):
+            sections = st.session_state["url_projects"]
+            selected_project = st.selectbox(
+                "Select a project",
+                list(sections.keys()),
+                help="This page contains multiple projects. Pick the one you want to parse.",
+            )
+            if selected_project:
+                project_text = sections[selected_project]
+                st.session_state["pdf_text"] = project_text
+
+                # Auto-fill project details from the selection
+                parts = selected_project.split(" — ", 1)
+                if len(parts) == 2 and not project_name:
+                    # Only suggest, don't overwrite if user already typed something
+                    st.caption(
+                        f"Tip: project number **{parts[0]}**, "
+                        f"name **{parts[1]}** — fill these in the sidebar."
+                    )
+
+                with st.expander(
+                    f"Preview: {selected_project} ({len(project_text):,} chars)"
+                ):
+                    st.text(project_text[:5000])
+
         source_text = st.session_state.get("pdf_text", "")
         parse_mode = "exhibit_index"
 
